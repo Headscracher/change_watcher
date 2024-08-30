@@ -24,6 +24,10 @@ std::atomic<bool> stop_flag(false);
 
 pid_t command_pid;
 
+int inotify_fd;
+
+int watcher_pid;
+
 void timer_function() {
     while (!stop_flag) {
         if (event_occurred) {
@@ -31,6 +35,7 @@ void timer_function() {
 
             if (!reset_timer) {
                 if (command_pid > 0) {
+                    std::cout << "Killing previous command ..." << std::endl;
                     killpg(command_pid, SIGKILL);
                     std::cout << "Reloading ..." << std::endl;
                 }
@@ -51,6 +56,7 @@ void timer_function() {
         }
     }
 }
+
 
 void add_watch_recursive(int inotify_fd, const std::string &directory, const std::vector<std::string> &exclude_paths, std::map<int, std::string> &watch_descriptors) {
     // Skip adding watch if the directory is in the exclude paths
@@ -91,7 +97,13 @@ void add_watch_recursive(int inotify_fd, const std::string &directory, const std
 }
 
 void cancel_execution(int signal) {
+    std::cout << "Received SIGINT. Stopping ..." << std::endl;
     stop_flag = true;
+    if (watcher_pid > 0) {
+        std::cout << "Killing watcher ..." << watcher_pid << std::endl;
+        kill(watcher_pid, SIGINT);
+        waitpid(watcher_pid, nullptr, 0);
+    }
     if (command_pid > 0) {
         killpg(command_pid, SIGINT);
         waitpid(command_pid, nullptr, 0);
@@ -100,6 +112,8 @@ void cancel_execution(int signal) {
 
 int main(int argc, char *argv[]) 
 {
+    std::thread timer_thread(timer_function);
+    timer_thread.detach();
     signal(SIGINT, cancel_execution);
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <directory_to_watch> <command_to_run> [exclude_directory1] [exclude_directory2] ..." << std::endl;
@@ -117,79 +131,80 @@ int main(int argc, char *argv[])
         system(command.c_str());
         return 0;
     } else if (command_pid > 0) {
-        // Parent process
-        setpgid(command_pid, command_pid);
         int status;
-        while (!stop_flag) {
-            pid_t result = waitpid(command_pid, &status, WNOHANG);
-            if (result == 0) {
-                // Child process is still running
-                usleep(100000);
-            } else if (result == -1) {
-                std::cerr << "Error during waitpid.\n";
-                break;
-            } else {
-                break;
-            }
-        }
-    }
-
-    int inotify_fd = inotify_init();
-    if (inotify_fd < 0) {
-        std::cerr << "Failed to initialize inotify: " << strerror(errno) << std::endl;
-        return 1;
-    }
-
-    std::string path_to_watch = argv[1];
-    std::vector<std::string> exclude_paths = {};
-    for (int i = 3; i < argc; i++) {
-        exclude_paths.push_back(argv[i]);
-    }
-
-    std::map<int, std::string> watch_descriptors;
-
-    // Add initial watch for the base directory and its subdirectories
-    add_watch_recursive(inotify_fd, path_to_watch, exclude_paths, watch_descriptors);
-
-    const size_t event_size = sizeof(struct inotify_event);
-    const size_t buffer_size = 1024 * (event_size + 16);
-    char buffer[buffer_size];
-
-    std::thread timer_thread(timer_function);
-
-    while (!stop_flag) {
-        int length = read(inotify_fd, buffer, buffer_size);
-        if (length < 0) {
-            std::cerr << "Error reading from inotify file descriptor: " << strerror(errno) << std::endl;
-            break;
+        inotify_fd = inotify_init();
+        if (inotify_fd < 0) {
+            std::cerr << "Failed to initialize inotify: " << strerror(errno) << std::endl;
+            return 1;
         }
 
-        int i = 0;
-        while (i < length) {
-            struct inotify_event *event = (struct inotify_event *)&buffer[i];
+        std::string path_to_watch = argv[1];
+        std::vector<std::string> exclude_paths = {};
+        for (int i = 3; i < argc; i++) {
+            exclude_paths.push_back(argv[i]);
+        }
 
-            if (event->len > 0) {
-                std::string event_path = watch_descriptors[event->wd] + "/" + event->name;
+        std::map<int, std::string> watch_descriptors;
 
-                // Skip events from excluded directories
-                bool exclude = false;
-                for (const auto &exclude_path : exclude_paths) {
-                    if (event_path.find(exclude_path) == 0) {
-                        exclude = true;
+        // Add initial watch for the base directory and its subdirectories
+        add_watch_recursive(inotify_fd, path_to_watch, exclude_paths, watch_descriptors);
+
+            const size_t event_size = sizeof(struct inotify_event);
+            const size_t buffer_size = 1024 * (event_size + 16);
+            char buffer[buffer_size];
+
+
+            watcher_pid = fork();
+            if (watcher_pid == 0) {
+                while (!stop_flag) {
+                    std::cout << "Waiting for events ..." << std::endl;
+
+                    int length = read(inotify_fd, buffer, buffer_size);
+                    std::cout << "Received " << length << " bytes" << std::endl;
+                    if (length < 0) {
+                        std::cerr << "Error reading from inotify file descriptor: " << strerror(errno) << std::endl;
                         break;
                     }
-                }
 
-                if (!exclude) {
-                    event_occurred = true;
-                    reset_timer = true;
-                }
+                    int i = 0;
+                    while (i < length) {
+                        struct inotify_event *event = (struct inotify_event *)&buffer[i];
+
+                        if (event->len > 0) {
+                            std::string event_path = watch_descriptors[event->wd] + "/" + event->name;
+                            // Skip events from excluded directories
+                            bool exclude = false;
+                            for (const auto &exclude_path : exclude_paths) {
+                                if (event_path.find(exclude_path) == 0) {
+                                    exclude = true;
+                                    break;
+                                }
+                            }
+
+                            if (!exclude) {
+                                event_occurred = true;
+                                reset_timer = true;
+                            }
+                        }
+
+                        i += event_size + event->len;
+                    }
+                    pid_t result = waitpid(command_pid, &status, WNOHANG);
+                    if (result == 0) {
+                        // Child process is still running
+                        usleep(100000);
+                    } else if (result == -1) {
+                        std::cerr << "Error during waitpid.\n";
+                        break;
+                    } else {
+                        break;
+                    }
             }
-
-            i += event_size + event->len;
-        }
+                return 0;
+            }
     }
-    timer_thread.join();
+    waitpid(watcher_pid, nullptr, 0);
+    // timer_thread.join();
 
     close(inotify_fd);
     return 0;
