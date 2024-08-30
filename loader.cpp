@@ -11,6 +11,8 @@
 #include <atomic>
 #include <chrono>
 #include <sys/wait.h>
+#include <sys/eventfd.h>
+#include <sys/select.h>
 
 const int TIMER_PERIOD_MS = 1000;
 
@@ -25,6 +27,7 @@ std::atomic<bool> stop_flag(false);
 pid_t command_pid;
 
 int inotify_fd;
+int event_fd;
 
 int watcher_pid;
 
@@ -32,12 +35,10 @@ void timer_function() {
     while (!stop_flag) {
         if (event_occurred) {
             std::this_thread::sleep_for(std::chrono::milliseconds(TIMER_PERIOD_MS));
-
             if (!reset_timer) {
+                std::cout << "Reloading ..." << std::endl;
                 if (command_pid > 0) {
-                    std::cout << "Killing previous command ..." << std::endl;
                     killpg(command_pid, SIGKILL);
-                    std::cout << "Reloading ..." << std::endl;
                 }
                 waitpid(command_pid, NULL, 0);
                 command_pid = fork();
@@ -97,10 +98,12 @@ void add_watch_recursive(int inotify_fd, const std::string &directory, const std
 }
 
 void cancel_execution(int signal) {
-    std::cout << "Received SIGINT. Stopping ..." << std::endl;
     stop_flag = true;
+
+    uint64_t u = 1;
+    write(event_fd, &u, sizeof(uint64_t));
+
     if (watcher_pid > 0) {
-        std::cout << "Killing watcher ..." << watcher_pid << std::endl;
         kill(watcher_pid, SIGINT);
         waitpid(watcher_pid, nullptr, 0);
     }
@@ -112,8 +115,6 @@ void cancel_execution(int signal) {
 
 int main(int argc, char *argv[]) 
 {
-    std::thread timer_thread(timer_function);
-    timer_thread.detach();
     signal(SIGINT, cancel_execution);
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <directory_to_watch> <command_to_run> [exclude_directory1] [exclude_directory2] ..." << std::endl;
@@ -131,10 +132,16 @@ int main(int argc, char *argv[])
         system(command.c_str());
         return 0;
     } else if (command_pid > 0) {
-        int status;
         inotify_fd = inotify_init();
         if (inotify_fd < 0) {
             std::cerr << "Failed to initialize inotify: " << strerror(errno) << std::endl;
+            return 1;
+        }
+
+        event_fd = eventfd(0, 0);
+        if (event_fd == -1) {
+            std::cerr << "Failed to create eventfd: " << strerror(errno) << std::endl;
+            close(inotify_fd);
             return 1;
         }
 
@@ -149,18 +156,34 @@ int main(int argc, char *argv[])
         // Add initial watch for the base directory and its subdirectories
         add_watch_recursive(inotify_fd, path_to_watch, exclude_paths, watch_descriptors);
 
-            const size_t event_size = sizeof(struct inotify_event);
-            const size_t buffer_size = 1024 * (event_size + 16);
-            char buffer[buffer_size];
+        const size_t event_size = sizeof(struct inotify_event);
+        const size_t buffer_size = 1024 * (event_size + 16);
+        char buffer[buffer_size];
 
+        watcher_pid = fork();
+        if (watcher_pid == 0) {
+            std::thread timer_thread(timer_function);
+            while (!stop_flag) {
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(inotify_fd, &fds);
+                FD_SET(event_fd, &fds);
 
-            watcher_pid = fork();
-            if (watcher_pid == 0) {
-                while (!stop_flag) {
-                    std::cout << "Waiting for events ..." << std::endl;
+                int max_fd = std::max(inotify_fd, event_fd) + 1;
 
+                int ret = select(max_fd, &fds, NULL, NULL, NULL);
+
+                if (ret == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    } else {
+                        std::cerr << "Error during select: " << strerror(errno) << std::endl;
+                        break;
+                    }
+                }
+
+                if (FD_ISSET(inotify_fd, &fds)) {
                     int length = read(inotify_fd, buffer, buffer_size);
-                    std::cout << "Received " << length << " bytes" << std::endl;
                     if (length < 0) {
                         std::cerr << "Error reading from inotify file descriptor: " << strerror(errno) << std::endl;
                         break;
@@ -189,24 +212,18 @@ int main(int argc, char *argv[])
 
                         i += event_size + event->len;
                     }
-                    pid_t result = waitpid(command_pid, &status, WNOHANG);
-                    if (result == 0) {
-                        // Child process is still running
-                        usleep(100000);
-                    } else if (result == -1) {
-                        std::cerr << "Error during waitpid.\n";
-                        break;
-                    } else {
-                        break;
-                    }
+                }
+
+                if (FD_ISSET(event_fd, &fds)) {
+                    break;
+                }
+                timer_thread.join();
             }
-                return 0;
-            }
+            return 0;
+        }
     }
     waitpid(watcher_pid, nullptr, 0);
-    // timer_thread.join();
-
+    close(event_fd);
     close(inotify_fd);
     return 0;
 }
-
